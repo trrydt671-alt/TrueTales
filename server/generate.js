@@ -87,10 +87,25 @@ async function run(job, { subject, extraContext, length, tones }) {
   const toneList = (tones || []).map((t) => TONES[t]).filter(Boolean);
   const params = { subject, extraContext, lengthSpec, toneList, job };
 
-  // 1. Research + write (web search grounding is mandatory in both providers)
+  // 1. Research + write
   job.status = 'researching';
-  const { markdown, sources } =
-    TEXT_PROVIDER === 'anthropic' ? await writeBookAnthropic(params) : await writeBookGemini(params);
+  let result;
+  if (TEXT_PROVIDER === 'anthropic') {
+    result = await writeBookAnthropic(params);
+  } else {
+    try {
+      // Best case: Gemini researches the live web itself (search grounding).
+      result = await writeBookGemini(params);
+    } catch (err) {
+      // Search grounding has zero quota on many free keys. Fall back to doing
+      // the research ourselves: fetch Wikipedia articles (free, keyless) and
+      // have Gemini write strictly from that verified material.
+      console.error('Grounded generation unavailable, using Wikipedia research:', err.message);
+      job.status = 'researching';
+      result = await writeBookFromWikipedia(params);
+    }
+  }
+  const { markdown, sources } = result;
 
   // 2. Cover: designed typographic SVG - no image API, nothing to fail or cost
   job.status = 'illustrating';
@@ -129,10 +144,10 @@ async function fetchWithRetry(url, options) {
 }
 
 // ---------------------------------------------------------------------------
-// Gemini writer (default): Google Search grounding, free tier.
-// Model self-discovery: asks Google which models this key can use, ranks them
-// (newest Flash first), and fails over on 404 (retired) / 429 (out of quota),
-// so Google renaming or retiring models never breaks the app.
+// Gemini plumbing: model self-discovery + failover.
+// Asks Google which models this key can use, ranks them (newest Flash first),
+// and fails over on 404 (retired) / 429 (out of quota), so Google renaming or
+// retiring models never breaks the app.
 // ---------------------------------------------------------------------------
 const STATIC_FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-3.5-flash', 'gemini-2.5-flash'];
 let cachedModelList = null; // { list, at }
@@ -157,7 +172,6 @@ async function geminiCandidates(apiKey) {
       const tier = (n) =>
         /flash-lite/.test(n) ? 2 : /flash/.test(n) ? (/preview|exp/.test(n) ? 1 : 0) : 3;
       names.sort((a, b) => tier(a) - tier(b) || ver(b) - ver(a));
-      // de-dup near-identical entries (e.g. -001 suffixes)
       const seen = new Set();
       const list = [];
       for (const n of names) {
@@ -174,87 +188,170 @@ async function geminiCandidates(apiKey) {
   }
 }
 
+// Run one generateContent request across candidate models until one succeeds.
+async function geminiGenerateWithFailover({ apiKey, requestBody, label }) {
+  const discovered = await geminiCandidates(apiKey);
+  const candidates = [...new Set([...(workingModel ? [workingModel] : []), ...discovered])];
+  const attempts = [];
+
+  for (const model of candidates) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+    let res;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: requestBody,
+      });
+    } catch {
+      attempts.push(`${model}: network error`);
+      continue;
+    }
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      attempts.push(`${model}: HTTP ${res.status}`);
+      if ([400, 403, 404, 429].includes(res.status)) continue; // try next model
+      throw new Error(`Gemini API error ${res.status} (${model}): ${body.slice(0, 300)}`);
+    }
+
+    const data = await res.json();
+    const cand = data.candidates?.[0];
+    const text = (cand?.content?.parts || []).map((p) => p.text || '').join('').trim();
+    if (!text) {
+      attempts.push(`${model}: empty response (${cand?.finishReason || 'unknown'})`);
+      continue;
+    }
+    workingModel = model;
+    return { text, cand };
+  }
+
+  throw new Error(`${label}: no Gemini model succeeded. Tried -> ${attempts.join('; ')}`);
+}
+
+// ---------------------------------------------------------------------------
+// Strategy A: Gemini with Google Search grounding (best research, but the
+// grounding feature has zero free quota on many keys).
+// ---------------------------------------------------------------------------
 async function writeBookGemini({ subject, extraContext, lengthSpec, toneList, job }) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set on the server');
-
-  const discovered = await geminiCandidates(apiKey);
-  const candidates = [...new Set([...(workingModel ? [workingModel] : []), ...discovered])];
 
   const requestBody = JSON.stringify({
     systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
     contents: [{ role: 'user', parts: [{ text: buildUserPrompt({ subject, extraContext, lengthSpec, toneList }) }] }],
     tools: [{ google_search: {} }],
     generationConfig: {
-      // headroom so internal "thinking" tokens don't eat the book's budget
       maxOutputTokens: lengthSpec.maxTokens + 4096,
       temperature: 0.9,
     },
   });
 
-  const attempts = [];
-  for (let round = 0; round < 2; round++) {
-    for (const model of candidates) {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-      let res;
-      try {
-        res = await fetch(url, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: requestBody,
-        });
-      } catch (netErr) {
-        attempts.push(`${model}: network error`);
-        continue;
-      }
+  const { text, cand } = await geminiGenerateWithFailover({ apiKey, requestBody, label: 'Search-grounded writing' });
+  job.status = 'writing';
 
-      if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        attempts.push(`${model}: HTTP ${res.status}`);
-        // retired model, quota exhausted, or unsupported feature -> try next model
-        if ([400, 403, 404, 429].includes(res.status)) continue;
-        throw new Error(`Gemini API error ${res.status} (${model}): ${body.slice(0, 300)}`);
-      }
-
-      const data = await res.json();
-      const cand = data.candidates?.[0];
-      let markdown = (cand?.content?.parts || []).map((p) => p.text || '').join('').trim();
-      if (!markdown) {
-        attempts.push(`${model}: empty response (${cand?.finishReason || 'unknown'})`);
-        continue;
-      }
-
-      // success
-      workingModel = model;
-      job.status = 'writing';
-
-      const sources = [];
-      const seen = new Set();
-      for (const chunk of cand?.groundingMetadata?.groundingChunks || []) {
-        const w = chunk.web;
-        if (w?.uri && !seen.has(w.uri)) {
-          seen.add(w.uri);
-          sources.push({ url: w.uri, title: w.title || w.uri });
-        }
-      }
-
-      if (!markdown.startsWith('#')) markdown = `# ${subject}\n\n${markdown}`;
-      return { markdown, sources: sources.slice(0, 25) };
-    }
-
-    // every candidate failed; if any hit a rate limit, wait 30s and try once more
-    if (round === 0 && attempts.some((a) => a.includes('429'))) {
-      await new Promise((r) => setTimeout(r, 30000));
-    } else {
-      break;
+  const sources = [];
+  const seen = new Set();
+  for (const chunk of cand?.groundingMetadata?.groundingChunks || []) {
+    const w = chunk.web;
+    if (w?.uri && !seen.has(w.uri)) {
+      seen.add(w.uri);
+      sources.push({ url: w.uri, title: w.title || w.uri });
     }
   }
 
-  throw new Error(
-    `No Gemini model succeeded. Tried -> ${attempts.join('; ')}. ` +
-    `If these are 429s, the free daily quota may be used up (it resets daily). ` +
-    `Check usage at https://ai.dev/rate-limit`
-  );
+  let markdown = text;
+  if (!markdown.startsWith('#')) markdown = `# ${subject}\n\n${markdown}`;
+  return { markdown, sources: sources.slice(0, 25) };
+}
+
+// ---------------------------------------------------------------------------
+// Strategy B: research Wikipedia ourselves (free, keyless, no quota), then
+// have Gemini write strictly from that material - a plain generateContent
+// call, which has a real free-tier quota.
+// ---------------------------------------------------------------------------
+const WIKI_HEADERS = { 'user-agent': 'TrueTales/1.0 (personal library app)' };
+
+async function researchWikipedia(subject, extraContext) {
+  const query = [subject, extraContext].filter(Boolean).join(' ').slice(0, 250);
+  const searchUrl =
+    'https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=5&srsearch=' +
+    encodeURIComponent(query);
+  const sres = await fetch(searchUrl, { headers: WIKI_HEADERS });
+  if (!sres.ok) throw new Error(`Wikipedia search failed (${sres.status})`);
+  const sdata = await sres.json();
+  const titles = (sdata.query?.search || []).map((r) => r.title).slice(0, 4);
+  if (!titles.length) {
+    throw new Error(`No Wikipedia articles found for "${subject}". Try adding more detail (full name, what they are known for).`);
+  }
+
+  const pages = [];
+  for (const title of titles) {
+    if (pages.length >= 3) break;
+    const exUrl =
+      'https://en.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=1&redirects=1&format=json&titles=' +
+      encodeURIComponent(title);
+    try {
+      const eres = await fetch(exUrl, { headers: WIKI_HEADERS });
+      if (!eres.ok) continue;
+      const edata = await eres.json();
+      const page = Object.values(edata.query?.pages || {})[0];
+      const extract = (page?.extract || '').trim();
+      if (!extract || /may refer to[:\s]/i.test(extract.slice(0, 200))) continue; // skip disambiguation
+      pages.push({
+        title: page.title || title,
+        url: 'https://en.wikipedia.org/wiki/' + encodeURIComponent((page.title || title).replace(/ /g, '_')),
+        text: extract.slice(0, 14000),
+      });
+    } catch { /* skip page */ }
+  }
+
+  if (!pages.length) throw new Error(`Could not fetch usable Wikipedia material for "${subject}".`);
+  return pages;
+}
+
+const SYSTEM_PROMPT_FROM_MATERIAL = `You are a narrative nonfiction author in the tradition of Erik Larson and Laura Hillenbrand. You write short, gripping, rigorously factual books.
+
+The user message contains RESEARCH MATERIAL fetched from Wikipedia. That material is your ONLY permitted source of facts.
+
+NON-NEGOTIABLE RULES:
+1. EVERY factual claim - names, dates, places, events, numbers - must come from the research material. Never add facts from memory. Never invent quotes, dialogue, thoughts, or scenes. You may only quote words that appear in the material.
+2. If the material is thin or contradictory, say so gracefully inside the narrative ("accounts differ", "little is recorded") and write a shorter honest book rather than padding with invention.
+3. Within those constraints, write with real craft: scene-setting, tension, momentum, a strong narrative voice. Atmosphere and interpretation are welcome; fabricated facts are not.
+
+OUTPUT FORMAT - respond with ONLY the book, in Markdown:
+- Line 1: "# <evocative title>" (a real book title, not just the subject's name)
+- Optionally a one-line italic subtitle
+- Then 3-7 chapters, each starting with "## <chapter title>"
+- No preamble, no closing notes, no meta-commentary.`;
+
+async function writeBookFromWikipedia({ subject, extraContext, lengthSpec, toneList, job }) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY is not set on the server');
+
+  const pages = await researchWikipedia(subject, extraContext);
+  const material = pages
+    .map((p, i) => `--- SOURCE ${i + 1}: ${p.title} (${p.url}) ---\n${p.text}`)
+    .join('\n\n');
+
+  const userPrompt = buildUserPrompt({ subject, extraContext, lengthSpec, toneList }) +
+    `\n\nRESEARCH MATERIAL (your only permitted source of facts):\n\n${material}`;
+
+  const requestBody = JSON.stringify({
+    systemInstruction: { parts: [{ text: SYSTEM_PROMPT_FROM_MATERIAL }] },
+    contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+    generationConfig: {
+      maxOutputTokens: lengthSpec.maxTokens + 4096,
+      temperature: 0.9,
+    },
+  });
+
+  const { text } = await geminiGenerateWithFailover({ apiKey, requestBody, label: 'Writing from Wikipedia research' });
+  job.status = 'writing';
+
+  let markdown = text;
+  if (!markdown.startsWith('#')) markdown = `# ${subject}\n\n${markdown}`;
+  return { markdown, sources: pages.map((p) => ({ url: p.url, title: `Wikipedia: ${p.title}` })) };
 }
 
 // ---------------------------------------------------------------------------
