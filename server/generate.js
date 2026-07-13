@@ -129,62 +129,132 @@ async function fetchWithRetry(url, options) {
 }
 
 // ---------------------------------------------------------------------------
-// Gemini writer (default): Google Search grounding, free tier
+// Gemini writer (default): Google Search grounding, free tier.
+// Model self-discovery: asks Google which models this key can use, ranks them
+// (newest Flash first), and fails over on 404 (retired) / 429 (out of quota),
+// so Google renaming or retiring models never breaks the app.
 // ---------------------------------------------------------------------------
+const STATIC_FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-3.5-flash', 'gemini-2.5-flash'];
+let cachedModelList = null; // { list, at }
+let workingModel = null;    // last model that succeeded
+
+async function geminiCandidates(apiKey) {
+  if (process.env.GEMINI_TEXT_MODEL) return [process.env.GEMINI_TEXT_MODEL];
+  try {
+    if (!cachedModelList || Date.now() - cachedModelList.at > 60 * 60 * 1000) {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}&pageSize=1000`
+      );
+      if (!res.ok) throw new Error(`ListModels returned ${res.status}`);
+      const data = await res.json();
+      const exclude = /image|imagen|embed|tts|audio|live|veo|aqa|learnlm|robotics|gemma|nano|omni/i;
+      const names = (data.models || [])
+        .filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
+        .map((m) => (m.name || '').replace(/^models\//, ''))
+        .filter((n) => /gemini/i.test(n) && !exclude.test(n));
+      const ver = (n) => { const m = n.match(/gemini-(\d+(?:\.\d+)?)/); return m ? parseFloat(m[1]) : 0; };
+      // rank: stable flash > preview/exp flash > flash-lite > everything else; newer versions first
+      const tier = (n) =>
+        /flash-lite/.test(n) ? 2 : /flash/.test(n) ? (/preview|exp/.test(n) ? 1 : 0) : 3;
+      names.sort((a, b) => tier(a) - tier(b) || ver(b) - ver(a));
+      // de-dup near-identical entries (e.g. -001 suffixes)
+      const seen = new Set();
+      const list = [];
+      for (const n of names) {
+        const base = n.replace(/-\d{3}$/, '');
+        if (!seen.has(base)) { seen.add(base); list.push(n); }
+      }
+      cachedModelList = { list: list.slice(0, 6), at: Date.now() };
+      console.log('Gemini models discovered:', cachedModelList.list.join(', '));
+    }
+    return cachedModelList.list.length ? cachedModelList.list : STATIC_FALLBACK_MODELS;
+  } catch (err) {
+    console.error('Model discovery failed, using static fallback list:', err.message);
+    return STATIC_FALLBACK_MODELS;
+  }
+}
+
 async function writeBookGemini({ subject, extraContext, lengthSpec, toneList, job }) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set on the server');
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TEXT_MODEL}:generateContent?key=${apiKey}`;
-  const res = await fetchWithRetry(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-      contents: [{ role: 'user', parts: [{ text: buildUserPrompt({ subject, extraContext, lengthSpec, toneList }) }] }],
-      tools: [{ google_search: {} }],
-      generationConfig: {
-        // headroom so internal "thinking" tokens don't eat the book's budget
-        maxOutputTokens: lengthSpec.maxTokens + 4096,
-        temperature: 0.9,
-      },
-    }),
+  const discovered = await geminiCandidates(apiKey);
+  const candidates = [...new Set([...(workingModel ? [workingModel] : []), ...discovered])];
+
+  const requestBody = JSON.stringify({
+    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+    contents: [{ role: 'user', parts: [{ text: buildUserPrompt({ subject, extraContext, lengthSpec, toneList }) }] }],
+    tools: [{ google_search: {} }],
+    generationConfig: {
+      // headroom so internal "thinking" tokens don't eat the book's budget
+      maxOutputTokens: lengthSpec.maxTokens + 4096,
+      temperature: 0.9,
+    },
   });
 
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    if (res.status === 429) {
-      throw new Error(
-        `Gemini rate limit (429). The free tier allows a limited number of requests per minute/day for model "${GEMINI_TEXT_MODEL}". Wait a minute and try again; if it persists, check your usage at https://ai.dev/rate-limit or try a different GEMINI_TEXT_MODEL. Details: ${body.slice(0, 200)}`
-      );
+  const attempts = [];
+  for (let round = 0; round < 2; round++) {
+    for (const model of candidates) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      let res;
+      try {
+        res = await fetch(url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: requestBody,
+        });
+      } catch (netErr) {
+        attempts.push(`${model}: network error`);
+        continue;
+      }
+
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        attempts.push(`${model}: HTTP ${res.status}`);
+        // retired model, quota exhausted, or unsupported feature -> try next model
+        if ([400, 403, 404, 429].includes(res.status)) continue;
+        throw new Error(`Gemini API error ${res.status} (${model}): ${body.slice(0, 300)}`);
+      }
+
+      const data = await res.json();
+      const cand = data.candidates?.[0];
+      let markdown = (cand?.content?.parts || []).map((p) => p.text || '').join('').trim();
+      if (!markdown) {
+        attempts.push(`${model}: empty response (${cand?.finishReason || 'unknown'})`);
+        continue;
+      }
+
+      // success
+      workingModel = model;
+      job.status = 'writing';
+
+      const sources = [];
+      const seen = new Set();
+      for (const chunk of cand?.groundingMetadata?.groundingChunks || []) {
+        const w = chunk.web;
+        if (w?.uri && !seen.has(w.uri)) {
+          seen.add(w.uri);
+          sources.push({ url: w.uri, title: w.title || w.uri });
+        }
+      }
+
+      if (!markdown.startsWith('#')) markdown = `# ${subject}\n\n${markdown}`;
+      return { markdown, sources: sources.slice(0, 25) };
     }
-    throw new Error(`Gemini API error ${res.status}: ${body.slice(0, 300)}`);
-  }
 
-  const data = await res.json();
-  job.status = 'writing';
-
-  const cand = data.candidates?.[0];
-  let markdown = (cand?.content?.parts || [])
-    .map((p) => p.text || '')
-    .join('')
-    .trim();
-  if (!markdown) {
-    throw new Error(`The model returned no book text (finishReason: ${cand?.finishReason || 'unknown'})`);
-  }
-
-  const sources = [];
-  const seen = new Set();
-  for (const chunk of cand?.groundingMetadata?.groundingChunks || []) {
-    const w = chunk.web;
-    if (w?.uri && !seen.has(w.uri)) {
-      seen.add(w.uri);
-      sources.push({ url: w.uri, title: w.title || w.uri });
+    // every candidate failed; if any hit a rate limit, wait 30s and try once more
+    if (round === 0 && attempts.some((a) => a.includes('429'))) {
+      await new Promise((r) => setTimeout(r, 30000));
+    } else {
+      break;
     }
   }
 
-  if (!markdown.startsWith('#')) markdown = `# ${subject}\n\n${markdown}`;
-  return { markdown, sources: sources.slice(0, 25) };
+  throw new Error(
+    `No Gemini model succeeded. Tried -> ${attempts.join('; ')}. ` +
+    `If these are 429s, the free daily quota may be used up (it resets daily). ` +
+    `Check usage at https://ai.dev/rate-limit`
+  );
 }
 
 // ---------------------------------------------------------------------------
