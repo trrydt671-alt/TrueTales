@@ -30,8 +30,20 @@ export async function initDb() {
       cover_mime TEXT,
       cover_data TEXT,
       sources TEXT,
+      reading_level TEXT,
+      story_form TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )
   `);
+
+  // Migration for databases created before Update 2 (old books keep working;
+  // their new columns are simply NULL).
+  for (const col of ['reading_level', 'story_form']) {
+    try {
+      await db.execute(`ALTER TABLE books ADD COLUMN ${col} TEXT`);
+    } catch {
+      /* column already exists */
+    }
+  }
 }

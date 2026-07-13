@@ -20,6 +20,21 @@ const LENGTHS = [
   { id: 'long',   label: 'Long',   desc: '~35 min read' },
 ];
 
+const READING_LEVELS = [
+  { id: 'default',  label: '✨ Default',      desc: 'Balanced — let the app choose' },
+  { id: 'easy',     label: 'Easy & Clear',    desc: 'Short sentences, everyday words' },
+  { id: 'standard', label: 'Standard',        desc: 'Normal adult nonfiction' },
+  { id: 'rich',     label: 'Rich & Literary', desc: 'Layered prose, rich vocabulary' },
+];
+
+const STORY_FORMS = [
+  { id: 'default',      label: '✨ Default',       desc: 'Best fit for subject & tones' },
+  { id: 'cinematic',    label: '🎬 Cinematic',     desc: 'Scene by scene, like a film' },
+  { id: 'documentary',  label: '🎞️ Documentary',   desc: 'Clear chronological account' },
+  { id: 'bedtime',      label: '🌙 Bedtime-story', desc: 'Warm, flowing, told aloud' },
+  { id: 'journalistic', label: '📰 Journalistic',  desc: 'Crisp, investigative, fact-forward' },
+];
+
 const PHASE_TEXT = {
   researching: 'Researching the real facts…',
   writing: 'Writing the chapters…',
@@ -43,6 +58,8 @@ export default function NewBook() {
   const [extraContext, setExtraContext] = useState('');
   const [length, setLength] = useState('medium');
   const [tones, setTones] = useState([]);
+  const [readingLevel, setReadingLevel] = useState('default');
+  const [storyForm, setStoryForm] = useState('default');
   const [job, setJob] = useState(null); // { id, status }
   const [error, setError] = useState(null);
   const [flavorIdx, setFlavorIdx] = useState(0);
@@ -54,7 +71,7 @@ export default function NewBook() {
   const start = async () => {
     setError(null);
     try {
-      const { jobId } = await api.generate({ subject, extraContext, length, tones });
+      const { jobId } = await api.generate({ subject, extraContext, length, tones, readingLevel, storyForm });
       setJob({ id: jobId, status: 'researching' });
     } catch (e) {
       setError(e.message);
@@ -172,6 +189,38 @@ export default function NewBook() {
                   onClick={() => toggleTone(t.id)}
                 >
                   {t.emoji} {t.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="field">
+            <span className="field-label">Reading level</span>
+            <div className="choice-grid">
+              {READING_LEVELS.map((o) => (
+                <button
+                  key={o.id}
+                  className={readingLevel === o.id ? 'choice active' : 'choice'}
+                  onClick={() => setReadingLevel(o.id)}
+                >
+                  <strong>{o.label}</strong>
+                  <small>{o.desc}</small>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="field">
+            <span className="field-label">Storytelling form</span>
+            <div className="choice-grid">
+              {STORY_FORMS.map((o) => (
+                <button
+                  key={o.id}
+                  className={storyForm === o.id ? 'choice active' : 'choice'}
+                  onClick={() => setStoryForm(o.id)}
+                >
+                  <strong>{o.label}</strong>
+                  <small>{o.desc}</small>
                 </button>
               ))}
             </div>

@@ -25,6 +25,24 @@ const TONES = {
   witty:       'Witty & Playful - light touch, irony, the absurd and delightful sides of the story',
 };
 
+// Update 2: writing-style choices. 'default' means "let the model decide" -
+// no extra instruction is added, which matches the app's behaviour before
+// this update (full backward compatibility).
+export const READING_LEVELS = {
+  default:  null,
+  easy:     'Easy & Clear - short sentences, everyday words, no jargon; anyone can follow, including young or second-language readers',
+  standard: 'Standard - the register of normal adult narrative nonfiction',
+  rich:     'Rich & Literary - layered sentences, sophisticated vocabulary, prose that rewards slow reading',
+};
+
+export const STORY_FORMS = {
+  default:      null,
+  cinematic:    'Cinematic - scene-by-scene, like watching a film: concrete settings, cuts between moments, show rather than summarize',
+  documentary:  'Documentary - a clear chronological account with historical context, the measured voice of a great documentary narrator',
+  bedtime:      'Bedtime-story-like - warm, flowing, told-aloud feeling, gentle rhythm, as if read by a fireside (still strictly factual)',
+  journalistic: 'Journalistic - crisp, investigative, fact-forward; short paragraphs, telling details, the discipline of longform reporting',
+};
+
 const SYSTEM_PROMPT = `You are a narrative nonfiction author in the tradition of Erik Larson and Laura Hillenbrand. You write short, gripping, rigorously factual books.
 
 NON-NEGOTIABLE RULES:
@@ -39,14 +57,24 @@ OUTPUT FORMAT - respond with ONLY the book, in Markdown:
 - Then 3-7 chapters, each starting with "## <chapter title>"
 - No preamble, no closing notes, no meta-commentary.`;
 
-function buildUserPrompt({ subject, extraContext, lengthSpec, toneList }) {
+function buildUserPrompt({ subject, extraContext, lengthSpec, toneList, levelSpec, formSpec }) {
   const toneText = toneList.length
     ? `Tone and angle (blend these): ${toneList.join('; ')}`
     : 'Tone: engaging narrative nonfiction';
+
+  let styleText = '';
+  if (levelSpec || formSpec) {
+    styleText = '\nWriting style requested by the reader:';
+    if (levelSpec) styleText += `\n- Reading level: ${levelSpec}`;
+    if (formSpec) styleText += `\n- Storytelling form: ${formSpec}`;
+    styleText +=
+      '\nThese style choices shape ONLY how the text reads (sentence style, structure, voice). They never override the factual-accuracy rules: every fact must still come from your research material, and nothing may be invented.';
+  }
+
   return `Write a factually accurate narrative nonfiction book about: ${subject}
 ${extraContext ? `\nAdditional context from the reader: ${extraContext}` : ''}
 Target length: ${lengthSpec.words}.
-${toneText}
+${toneText}${styleText}
 
 Research thoroughly with web search first, then write the book.`;
 }
@@ -69,11 +97,11 @@ export function requiredKeyError() {
   return null;
 }
 
-export function startGeneration({ subject, extraContext, length, tones }) {
+export function startGeneration({ subject, extraContext, length, tones, readingLevel, storyForm }) {
   const id = crypto.randomUUID();
   const job = { id, status: 'researching', bookId: null, error: null, startedAt: Date.now() };
   jobs.set(id, job);
-  run(job, { subject, extraContext, length, tones }).catch((err) => {
+  run(job, { subject, extraContext, length, tones, readingLevel, storyForm }).catch((err) => {
     console.error('Generation failed:', err);
     job.status = 'error';
     job.error = err.message || 'Generation failed';
@@ -82,10 +110,12 @@ export function startGeneration({ subject, extraContext, length, tones }) {
   return id;
 }
 
-async function run(job, { subject, extraContext, length, tones }) {
+async function run(job, { subject, extraContext, length, tones, readingLevel, storyForm }) {
   const lengthSpec = LENGTHS[length] || LENGTHS.medium;
   const toneList = (tones || []).map((t) => TONES[t]).filter(Boolean);
-  const params = { subject, extraContext, lengthSpec, toneList, job };
+  const levelSpec = READING_LEVELS[readingLevel] || null;
+  const formSpec = STORY_FORMS[storyForm] || null;
+  const params = { subject, extraContext, lengthSpec, toneList, levelSpec, formSpec, job };
 
   // 1. Research + write
   job.status = 'researching';
@@ -118,11 +148,12 @@ async function run(job, { subject, extraContext, length, tones }) {
   const now = new Date().toISOString();
   await db.execute({
     sql: `INSERT INTO books (id, title, subject, extra_context, tones, length, content,
-          cover_mime, cover_data, sources, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          cover_mime, cover_data, sources, reading_level, story_form, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args: [
       bookId, title, subject, extraContext || '', JSON.stringify(tones || []), length,
-      markdown, cover.mime, cover.data, JSON.stringify(sources), now, now,
+      markdown, cover.mime, cover.data, JSON.stringify(sources),
+      readingLevel || 'default', storyForm || 'default', now, now,
     ],
   });
 
@@ -242,13 +273,13 @@ async function geminiGenerateWithFailover({ apiKey, requestBody, label, rounds =
 // Strategy A: Gemini with Google Search grounding (best research, but the
 // grounding feature has zero free quota on many keys).
 // ---------------------------------------------------------------------------
-async function writeBookGemini({ subject, extraContext, lengthSpec, toneList, job }) {
+async function writeBookGemini({ subject, extraContext, lengthSpec, toneList, levelSpec, formSpec, job }) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set on the server');
 
   const requestBody = JSON.stringify({
     systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-    contents: [{ role: 'user', parts: [{ text: buildUserPrompt({ subject, extraContext, lengthSpec, toneList }) }] }],
+    contents: [{ role: 'user', parts: [{ text: buildUserPrompt({ subject, extraContext, lengthSpec, toneList, levelSpec, formSpec }) }] }],
     tools: [{ google_search: {} }],
     generationConfig: {
       maxOutputTokens: lengthSpec.maxTokens + 4096,
@@ -334,7 +365,7 @@ OUTPUT FORMAT - respond with ONLY the book, in Markdown:
 - Then 3-7 chapters, each starting with "## <chapter title>"
 - No preamble, no closing notes, no meta-commentary.`;
 
-async function writeBookFromWikipedia({ subject, extraContext, lengthSpec, toneList, job }) {
+async function writeBookFromWikipedia({ subject, extraContext, lengthSpec, toneList, levelSpec, formSpec, job }) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set on the server');
 
@@ -343,7 +374,7 @@ async function writeBookFromWikipedia({ subject, extraContext, lengthSpec, toneL
     .map((p, i) => `--- SOURCE ${i + 1}: ${p.title} (${p.url}) ---\n${p.text}`)
     .join('\n\n');
 
-  const userPrompt = buildUserPrompt({ subject, extraContext, lengthSpec, toneList }) +
+  const userPrompt = buildUserPrompt({ subject, extraContext, lengthSpec, toneList, levelSpec, formSpec }) +
     `\n\nRESEARCH MATERIAL (your only permitted source of facts):\n\n${material}`;
 
   const requestBody = JSON.stringify({
@@ -366,7 +397,7 @@ async function writeBookFromWikipedia({ subject, extraContext, lengthSpec, toneL
 // ---------------------------------------------------------------------------
 // Anthropic writer (optional premium mode: TEXT_PROVIDER=anthropic)
 // ---------------------------------------------------------------------------
-async function writeBookAnthropic({ subject, extraContext, lengthSpec, toneList, job }) {
+async function writeBookAnthropic({ subject, extraContext, lengthSpec, toneList, levelSpec, formSpec, job }) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not set on the server');
 
@@ -381,7 +412,7 @@ async function writeBookAnthropic({ subject, extraContext, lengthSpec, toneList,
       model: ANTHROPIC_MODEL,
       max_tokens: lengthSpec.maxTokens,
       system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: buildUserPrompt({ subject, extraContext, lengthSpec, toneList }) }],
+      messages: [{ role: 'user', content: buildUserPrompt({ subject, extraContext, lengthSpec, toneList, levelSpec, formSpec }) }],
       tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 12 }],
     }),
   });

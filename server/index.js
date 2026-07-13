@@ -14,7 +14,7 @@ if (fs.existsSync(envFile)) {
 
 const { default: express } = await import('express');
 const { db, initDb } = await import('./db.js');
-const { startGeneration, getJob, requiredKeyError } = await import('./generate.js');
+const { startGeneration, getJob, requiredKeyError, READING_LEVELS, STORY_FORMS } = await import('./generate.js');
 
 await initDb();
 const app = express();
@@ -26,6 +26,8 @@ const rowToSummary = (r) => ({
   subject: r.subject,
   tones: JSON.parse(r.tones || '[]'),
   length: r.book_length,
+  reading_level: r.reading_level || 'default',
+  story_form: r.story_form || 'default',
   created_at: r.created_at,
   updated_at: r.updated_at,
   cover_url: `/api/books/${r.id}/cover?v=${encodeURIComponent(r.updated_at)}`,
@@ -35,7 +37,7 @@ app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 // --- Generation ---
 app.post('/api/books/generate', (req, res) => {
-  const { subject, extraContext, length, tones } = req.body || {};
+  const { subject, extraContext, length, tones, readingLevel, storyForm } = req.body || {};
   if (!subject || !String(subject).trim()) {
     return res.status(400).json({ error: 'subject is required' });
   }
@@ -48,6 +50,8 @@ app.post('/api/books/generate', (req, res) => {
     extraContext: String(extraContext || '').trim(),
     length: ['short', 'medium', 'long'].includes(length) ? length : 'medium',
     tones: Array.isArray(tones) ? tones.slice(0, 6) : [],
+    readingLevel: readingLevel in READING_LEVELS ? readingLevel : 'default',
+    storyForm: storyForm in STORY_FORMS ? storyForm : 'default',
   });
   res.status(202).json({ jobId });
 });
@@ -61,14 +65,14 @@ app.get('/api/generate/:jobId', (req, res) => {
 // --- Books CRUD ---
 app.get('/api/books', async (_req, res) => {
   const { rows } = await db.execute(
-    'SELECT id, title, subject, tones, length AS book_length, created_at, updated_at FROM books ORDER BY created_at DESC'
+    'SELECT id, title, subject, tones, length AS book_length, reading_level, story_form, created_at, updated_at FROM books ORDER BY created_at DESC'
   );
   res.json(rows.map(rowToSummary));
 });
 
 app.get('/api/books/:id', async (req, res) => {
   const { rows } = await db.execute({
-    sql: 'SELECT id, title, subject, extra_context, tones, length AS book_length, content, sources, created_at, updated_at FROM books WHERE id = ?',
+    sql: 'SELECT id, title, subject, extra_context, tones, length AS book_length, content, sources, reading_level, story_form, created_at, updated_at FROM books WHERE id = ?',
     args: [req.params.id],
   });
   if (!rows.length) return res.status(404).json({ error: 'Book not found' });

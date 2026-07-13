@@ -261,3 +261,166 @@ html, body {
   border-radius: 50%; animation: spin 0.8s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- writing-style choices (Update 2) ---------- */
+.choice-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.choice {
+  border: 1.5px solid var(--line);
+  background: var(--paper);
+  border-radius: 14px;
+  padding: 10px 10px;
+  font: inherit;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  text-align: left;
+  color: var(--ink);
+}
+.choice small { color: var(--ink-soft); font-size: 0.72rem; line-height: 1.3; }
+.choice.active { border-color: var(--accent); background: #fbeee7; }
+
+/* ---------- flip-book reader (Update 2) ---------- */
+.flipbook {
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  background: var(--paper);
+  overflow: hidden;
+  touch-action: pan-y;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.fb-nav {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: calc(10px + env(safe-area-inset-top)) 14px 8px;
+  border-bottom: 1px solid var(--line);
+  flex: none;
+  z-index: 5;
+}
+.fb-stage {
+  flex: 1;
+  min-height: 0;
+  padding: 12px 18px 6px;
+  perspective: 1600px;
+  cursor: pointer;
+}
+.fb-area { position: relative; width: 100%; height: 100%; }
+
+.fb-base { position: absolute; inset: 0; }
+
+/* one visible page */
+.fb-textpage, .fb-cover {
+  position: absolute; inset: 0;
+  overflow: hidden;
+  background: var(--card);
+  border-radius: 6px 10px 10px 6px;
+  box-shadow: 0 1px 3px rgba(84, 62, 38, 0.14), 0 8px 22px rgba(84, 62, 38, 0.10);
+}
+.fb-textpage { padding: 20px 22px; box-sizing: border-box; }
+.fb-cover {
+  background: var(--paper-deep);
+  display: flex; align-items: center; justify-content: center;
+}
+.fb-cover img {
+  max-width: 100%; max-height: 100%;
+  height: 100%; width: auto;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+/* the paginated text: CSS columns, one column per screen */
+.fb-content {
+  column-fill: auto;
+  overflow: visible;
+  will-change: transform;
+}
+.fb-content.prose { font-size: 1.02rem; line-height: 1.68; overflow-wrap: break-word; }
+
+.fb-content h2 {
+  break-before: column;
+  -webkit-column-break-before: always;
+  margin: 0.5em 0 0.8em;
+}
+.fb-content p:first-of-type { margin-top: 0; }
+
+.fb-titlepage { text-align: center; padding-top: 16vh; }
+.fb-titlepage h1 {
+  font-family: Georgia, serif;
+  font-size: 1.75rem; line-height: 1.25; margin: 0 0 14px;
+}
+.fb-titlepage h1::after {
+  content: "\2767"; display: block; color: var(--accent);
+  font-size: 1rem; margin-top: 18px;
+}
+.fb-meta { color: var(--ink-soft); font-size: 0.85rem; }
+
+.fb-sources { break-before: column; -webkit-column-break-before: always; }
+.fb-sources h2 { break-before: auto; -webkit-column-break-before: auto; }
+.fb-sources ul { padding-left: 18px; line-height: 1.6; }
+.fb-sources a { color: var(--accent-deep); word-break: break-all; font-size: 0.85rem; }
+
+/* hidden measuring clone */
+.fb-measure {
+  position: absolute; inset: 0;
+  visibility: hidden;
+  pointer-events: none;
+  overflow: hidden;
+  padding: 20px 22px;
+  box-sizing: border-box;
+  z-index: -1;
+}
+
+/* the turning page */
+.fb-flip {
+  position: absolute; inset: 0;
+  transform-style: preserve-3d;
+  transform-origin: left center;
+  z-index: 3;
+}
+.fb-face {
+  position: absolute; inset: 0;
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+  border-radius: 6px 10px 10px 6px;
+  overflow: hidden;
+}
+.fb-back {
+  transform: rotateY(180deg);
+  background:
+    linear-gradient(105deg, rgba(84, 62, 38, 0.16), rgba(84, 62, 38, 0.02) 30%, rgba(84, 62, 38, 0) 60%),
+    var(--card);
+}
+.fb-flip-fwd  { animation: fb-turn-fwd 520ms cubic-bezier(0.35, 0.05, 0.35, 1) both; }
+.fb-flip-back { animation: fb-turn-back 520ms cubic-bezier(0.35, 0.05, 0.35, 1) both; }
+@keyframes fb-turn-fwd {
+  0%   { transform: rotateY(0deg); }
+  100% { transform: rotateY(-180deg); }
+}
+@keyframes fb-turn-back {
+  0%   { transform: rotateY(-180deg); }
+  100% { transform: rotateY(0deg); }
+}
+/* moving shadow on the turning page for a paper feel */
+.fb-flip::after {
+  content: "";
+  position: absolute; inset: 0;
+  border-radius: 6px 10px 10px 6px;
+  pointer-events: none;
+  background: linear-gradient(to left, rgba(40, 28, 16, 0.20), rgba(40, 28, 16, 0) 45%);
+  animation: fb-shade 520ms ease both;
+}
+@keyframes fb-shade {
+  0% { opacity: 0; }
+  45% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+.fb-count {
+  flex: none;
+  text-align: center;
+  color: var(--ink-soft);
+  font-size: 0.78rem;
+  letter-spacing: 0.06em;
+  padding: 6px 0 calc(8px + env(safe-area-inset-bottom));
+}
