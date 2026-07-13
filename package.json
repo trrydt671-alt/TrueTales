@@ -1,0 +1,17 @@
+{
+  "name": "truetales",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server/index.js",
+    "build": "npm --prefix client install --no-audit --no-fund && npm --prefix client run build",
+    "dev:server": "node server/index.js",
+    "dev:client": "npm --prefix client run dev"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.15.0",
+    "express": "^4.21.2"
+  }
+}
