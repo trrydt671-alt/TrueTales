@@ -5,8 +5,7 @@ import { db } from './db.js';
 // or 'anthropic' (premium prose, ~$0.10-0.30/book).
 const TEXT_PROVIDER = (process.env.TEXT_PROVIDER || 'gemini').toLowerCase();
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-5';
-const GEMINI_TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || 'gemini-2.5-flash';
-const GEMINI_IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-2.5-flash-image';
+const GEMINI_TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || 'gemini-3.1-flash';
 
 const LENGTHS = {
   short:  { label: 'Short',  words: '800-1200 words',  maxTokens: 5000  },
@@ -62,10 +61,11 @@ export function getJob(id) {
 }
 
 export function requiredKeyError() {
-  if (!process.env.GEMINI_API_KEY) return 'Server is missing GEMINI_API_KEY';
-  if (TEXT_PROVIDER === 'anthropic' && !process.env.ANTHROPIC_API_KEY) {
-    return 'TEXT_PROVIDER=anthropic but ANTHROPIC_API_KEY is not set';
+  if (TEXT_PROVIDER === 'anthropic') {
+    if (!process.env.ANTHROPIC_API_KEY) return 'TEXT_PROVIDER=anthropic but ANTHROPIC_API_KEY is not set';
+    return null;
   }
+  if (!process.env.GEMINI_API_KEY) return 'Server is missing GEMINI_API_KEY';
   return null;
 }
 
@@ -92,16 +92,10 @@ async function run(job, { subject, extraContext, length, tones }) {
   const { markdown, sources } =
     TEXT_PROVIDER === 'anthropic' ? await writeBookAnthropic(params) : await writeBookGemini(params);
 
-  // 2. Cover image (Gemini, with graceful SVG fallback)
+  // 2. Cover: designed typographic SVG - no image API, nothing to fail or cost
   job.status = 'illustrating';
   const title = extractTitle(markdown) || subject;
-  let cover;
-  try {
-    cover = await generateCover({ title, subject, toneList });
-  } catch (err) {
-    console.error('Cover generation failed, using fallback:', err.message);
-    cover = svgFallbackCover(title);
-  }
+  const cover = svgCover({ title, subject, tones: tones || [] });
 
   // 3. Save
   job.status = 'saving';
@@ -122,6 +116,19 @@ async function run(job, { subject, extraContext, length, tones }) {
 }
 
 // ---------------------------------------------------------------------------
+// fetch with one retry on rate-limit / transient errors
+// ---------------------------------------------------------------------------
+async function fetchWithRetry(url, options) {
+  let res = await fetch(url, options);
+  if (res.status === 429 || res.status >= 500) {
+    // wait 30s and try once more (free-tier per-minute limits recover quickly)
+    await new Promise((r) => setTimeout(r, 30000));
+    res = await fetch(url, options);
+  }
+  return res;
+}
+
+// ---------------------------------------------------------------------------
 // Gemini writer (default): Google Search grounding, free tier
 // ---------------------------------------------------------------------------
 async function writeBookGemini({ subject, extraContext, lengthSpec, toneList, job }) {
@@ -129,7 +136,7 @@ async function writeBookGemini({ subject, extraContext, lengthSpec, toneList, jo
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set on the server');
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TEXT_MODEL}:generateContent?key=${apiKey}`;
-  const res = await fetch(url, {
+  const res = await fetchWithRetry(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -146,6 +153,11 @@ async function writeBookGemini({ subject, extraContext, lengthSpec, toneList, jo
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
+    if (res.status === 429) {
+      throw new Error(
+        `Gemini rate limit (429). The free tier allows a limited number of requests per minute/day for model "${GEMINI_TEXT_MODEL}". Wait a minute and try again; if it persists, check your usage at https://ai.dev/rate-limit or try a different GEMINI_TEXT_MODEL. Details: ${body.slice(0, 200)}`
+      );
+    }
     throw new Error(`Gemini API error ${res.status}: ${body.slice(0, 300)}`);
   }
 
@@ -182,7 +194,7 @@ async function writeBookAnthropic({ subject, extraContext, lengthSpec, toneList,
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not set on the server');
 
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
+  const res = await fetchWithRetry('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
       'x-api-key': apiKey,
@@ -236,74 +248,106 @@ async function writeBookAnthropic({ subject, extraContext, lengthSpec, toneList,
 }
 
 // ---------------------------------------------------------------------------
-// Gemini: cover image
+// Designed typographic SVG covers - no image API needed
 // ---------------------------------------------------------------------------
-async function generateCover({ title, subject, toneList }) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error('GEMINI_API_KEY is not set');
+const TONE_PALETTES = {
+  dramatic:    { bg1: '#5b2333', bg2: '#2b1016', accent: '#e8b04b' },
+  dark:        { bg1: '#1e2430', bg2: '#0c0f16', accent: '#9db4d0' },
+  heroic:      { bg1: '#1f4e5f', bg2: '#12303b', accent: '#e8c46b' },
+  adventurous: { bg1: '#2e5e4e', bg2: '#1a3a2f', accent: '#e9a15c' },
+  tragic:      { bg1: '#4a3b52', bg2: '#241c2b', accent: '#c9a3b5' },
+  triumphant:  { bg1: '#8a4a2b', bg2: '#4f2917', accent: '#f0d491' },
+  mysterious:  { bg1: '#2f3550', bg2: '#171a2c', accent: '#8fd0c6' },
+  intimate:    { bg1: '#7a5844', bg2: '#4a3427', accent: '#f2ddc2' },
+  witty:       { bg1: '#3d6a6a', bg2: '#234444', accent: '#f2c14e' },
+};
+const DEFAULT_PALETTES = Object.values(TONE_PALETTES);
 
-  const mood = toneList.length ? toneList.map((t) => t.split(' - ')[0]).join(', ') : 'evocative';
-  const prompt = `A beautiful illustrated book cover for a narrative nonfiction book titled "${title}", about ${subject}. Mood: ${mood}. Painterly, stylized, rich atmospheric color, strong central composition, portrait orientation. Absolutely no text, letters, or typography in the image.`;
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent?key=${apiKey}`;
-
-  const attempt = async (body) => {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const t = await res.text().catch(() => '');
-      throw new Error(`Gemini API error ${res.status}: ${t.slice(0, 300)}`);
-    }
-    const data = await res.json();
-    const parts = data.candidates?.[0]?.content?.parts || [];
-    const img = parts.find((p) => p.inlineData?.data);
-    if (!img) throw new Error('Gemini returned no image');
-    return { mime: img.inlineData.mimeType || 'image/png', data: img.inlineData.data };
-  };
-
-  try {
-    return await attempt({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { imageConfig: { aspectRatio: '3:4' } },
-    });
-  } catch {
-    return await attempt({ contents: [{ parts: [{ text: prompt }] }] });
-  }
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-function svgFallbackCover(title) {
-  const palettes = [
-    ['#7a5c9e', '#c47a5a'], ['#3f6d5a', '#c9a86a'], ['#5a4632', '#b56a5a'],
-    ['#31485e', '#8fa98f'], ['#6d3f4e', '#d9a566'],
-  ];
-  let hash = 0;
-  for (const ch of title) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
-  const [c1, c2] = palettes[hash % palettes.length];
-  const safe = title.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
-  const words = safe.split(' ');
+function wrap(text, maxChars) {
+  const words = text.split(/\s+/);
   const lines = [];
   let line = '';
   for (const w of words) {
-    if ((line + ' ' + w).trim().length > 16) { if (line) lines.push(line.trim()); line = w; }
+    if ((line + ' ' + w).trim().length > maxChars && line) { lines.push(line.trim()); line = w; }
     else line += ' ' + w;
   }
   if (line.trim()) lines.push(line.trim());
-  const tspans = lines.slice(0, 5)
-    .map((l, i) => `<tspan x="300" dy="${i === 0 ? 0 : 64}">${l}</tspan>`) 
+  return lines;
+}
+
+export function svgCover({ title, subject, tones }) {
+  let hash = 0;
+  for (const ch of title) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
+
+  const pal = TONE_PALETTES[tones?.[0]] || DEFAULT_PALETTES[hash % DEFAULT_PALETTES.length];
+
+  // Title sizing: shorter titles get bigger type
+  const titleLines = wrap(esc(title), 14).slice(0, 5);
+  const fontSize = titleLines.length <= 2 ? 60 : titleLines.length === 3 ? 52 : 44;
+  const lineH = Math.round(fontSize * 1.22);
+  const blockH = (titleLines.length - 1) * lineH;
+  const titleY = 400 - Math.round(blockH / 2);
+  const tspans = titleLines
+    .map((l, i) => `<tspan x="300" dy="${i === 0 ? 0 : lineH}">${l}</tspan>`)
     .join('');
+
+  const allSubjectLines = wrap(esc(subject), 30);
+  const subjectLines = allSubjectLines.slice(0, 2);
+  if (allSubjectLines.length > 2) subjectLines[1] += '\u2026';
+  const subjectSpans = subjectLines
+    .map((l, i) => `<tspan x="300" dy="${i === 0 ? 0 : 26}">${l}</tspan>`)
+    .join('');
+
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="800" viewBox="0 0 600 800">
-  <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-    <stop offset="0" stop-color="${c1}"/><stop offset="1" stop-color="${c2}"/>
-  </linearGradient></defs>
-  <rect width="600" height="800" fill="url(#g)"/>
-  <rect x="36" y="36" width="528" height="728" fill="none" stroke="#faf6ef" stroke-opacity="0.55" stroke-width="3"/>
-  <text x="300" y="${400 - (lines.length - 1) * 32}" text-anchor="middle" font-family="Georgia, serif"
-    font-size="52" fill="#faf6ef" font-weight="bold">${tspans}</text>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.6" y2="1">
+      <stop offset="0" stop-color="${pal.bg1}"/>
+      <stop offset="1" stop-color="${pal.bg2}"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.32" r="0.75">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="600" height="800" fill="url(#bg)"/>
+  <rect width="600" height="800" fill="url(#glow)"/>
+
+  <!-- spine shadow for a physical-book feel -->
+  <rect x="0" y="0" width="26" height="800" fill="#000000" opacity="0.18"/>
+
+  <!-- double frame -->
+  <rect x="42" y="42" width="516" height="716" fill="none" stroke="${pal.accent}" stroke-opacity="0.85" stroke-width="2.5"/>
+  <rect x="52" y="52" width="496" height="696" fill="none" stroke="${pal.accent}" stroke-opacity="0.35" stroke-width="1"/>
+
+  <!-- top ornament: drawn diamond motif (renders identically everywhere) -->
+  <g fill="${pal.accent}" stroke="${pal.accent}">
+    <rect x="289" y="109" width="22" height="22" transform="rotate(45 300 120)" fill-opacity="0.9" stroke="none"/>
+    <rect x="294" y="114" width="12" height="12" transform="rotate(45 300 120)" fill="${pal.bg2}" stroke="none"/>
+    <line x1="230" y1="120" x2="278" y2="120" stroke-width="1.5" stroke-opacity="0.7"/>
+    <line x1="322" y1="120" x2="370" y2="120" stroke-width="1.5" stroke-opacity="0.7"/>
+  </g>
+  <line x1="210" y1="158" x2="390" y2="158" stroke="${pal.accent}" stroke-opacity="0.6" stroke-width="1"/>
+
+  <!-- series label -->
+  <text x="300" y="196" text-anchor="middle" font-family="Georgia, serif" font-size="17"
+    letter-spacing="6" fill="${pal.accent}" fill-opacity="0.9">A TRUE TALE</text>
+
+  <!-- title -->
+  <text x="300" y="${titleY}" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif"
+    font-size="${fontSize}" font-weight="bold" fill="#f7f1e5">${tspans}</text>
+
+  <!-- bottom rule + subject -->
+  <line x1="210" y1="652" x2="390" y2="652" stroke="${pal.accent}" stroke-opacity="0.6" stroke-width="1"/>
+  <text x="300" y="688" text-anchor="middle" font-family="Georgia, serif" font-size="20"
+    font-style="italic" fill="${pal.accent}">${subjectSpans}</text>
 </svg>`;
-  return { mime: 'image/svg+xml', data: Buffer.from(svg).toString('base64') };
+
+  return { mime: 'image/svg+xml', data: Buffer.from(svg, 'utf8').toString('base64') };
 }
 
 function extractTitle(markdown) {
