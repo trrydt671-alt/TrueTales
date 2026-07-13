@@ -189,44 +189,53 @@ async function geminiCandidates(apiKey) {
 }
 
 // Run one generateContent request across candidate models until one succeeds.
-async function geminiGenerateWithFailover({ apiKey, requestBody, label }) {
+// Patient by design: ANY failure (rate limit, overload, retired model, network
+// blip) moves to the next model; between rounds it waits, like a human would.
+// Only a rejected API key stops it immediately.
+async function geminiGenerateWithFailover({ apiKey, requestBody, label, rounds = 3 }) {
   const discovered = await geminiCandidates(apiKey);
   const candidates = [...new Set([...(workingModel ? [workingModel] : []), ...discovered])];
   const attempts = [];
 
-  for (const model of candidates) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-    let res;
-    try {
-      res = await fetch(url, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: requestBody,
-      });
-    } catch {
-      attempts.push(`${model}: network error`);
-      continue;
-    }
+  for (let round = 0; round < rounds; round++) {
+    for (const model of candidates) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      let res;
+      try {
+        res = await fetch(url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: requestBody,
+        });
+      } catch {
+        attempts.push(`${model}: network error`);
+        continue;
+      }
 
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      attempts.push(`${model}: HTTP ${res.status}`);
-      if ([400, 403, 404, 429].includes(res.status)) continue; // try next model
-      throw new Error(`Gemini API error ${res.status} (${model}): ${body.slice(0, 300)}`);
-    }
+      if (!res.ok) {
+        await res.text().catch(() => '');
+        attempts.push(`${model}: HTTP ${res.status}`);
+        if (res.status === 401) {
+          throw new Error('Google rejected the API key (401). Open Render -> Environment and check GEMINI_API_KEY.');
+        }
+        continue; // anything else (429 quota, 404 retired, 5xx overload...): try next model
+      }
 
-    const data = await res.json();
-    const cand = data.candidates?.[0];
-    const text = (cand?.content?.parts || []).map((p) => p.text || '').join('').trim();
-    if (!text) {
-      attempts.push(`${model}: empty response (${cand?.finishReason || 'unknown'})`);
-      continue;
+      const data = await res.json();
+      const cand = data.candidates?.[0];
+      const text = (cand?.content?.parts || []).map((p) => p.text || '').join('').trim();
+      if (!text) {
+        attempts.push(`${model}: empty response (${cand?.finishReason || 'unknown'})`);
+        continue;
+      }
+      workingModel = model;
+      return { text, cand };
     }
-    workingModel = model;
-    return { text, cand };
+    // whole round failed; breathe before the next one (Google spikes are short)
+    if (round < rounds - 1) await new Promise((r) => setTimeout(r, 20000));
   }
 
-  throw new Error(`${label}: no Gemini model succeeded. Tried -> ${attempts.join('; ')}`);
+  throw new Error(`${label}: no Gemini model succeeded after ${rounds} round(s). Tried -> ${[...new Set(attempts)].join('; ')}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +256,7 @@ async function writeBookGemini({ subject, extraContext, lengthSpec, toneList, jo
     },
   });
 
-  const { text, cand } = await geminiGenerateWithFailover({ apiKey, requestBody, label: 'Search-grounded writing' });
+  const { text, cand } = await geminiGenerateWithFailover({ apiKey, requestBody, label: 'Search-grounded writing', rounds: 1 });
   job.status = 'writing';
 
   const sources = [];
